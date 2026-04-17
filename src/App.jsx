@@ -1,71 +1,211 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Area, AreaChart } from 'recharts';
 
 // ============================================================================
-// ETH OPTIONS VEGA SCALPING SCANNER
-// Mock data layer — replace fetchBinanceOptions() with real Binance API calls
-// Endpoint: GET https://eapi.binance.com/eapi/v1/mark
+// ETH OPTIONS VEGA SCALPING SCANNER — LIVE BINANCE FEED
+// Fetches from Binance European Options API + Spot API
 // ============================================================================
 
-const SPOT = 3847.20;
-const NOW = Date.now();
+const BINANCE_OPTIONS_BASE = 'https://eapi.binance.com';
+const BINANCE_SPOT_BASE = 'https://api.binance.com';
+const IV_HISTORY_KEY = 'vega_scan_iv_history';
+const POLL_INTERVAL = 60_000; // 60s
 
-// ---- Mock generator: simulates what /eapi/v1/mark returns per contract ----
-function generateMockChain() {
-  const expiries = [
-    { dte: 1, label: '1D' },
-    { dte: 2, label: '2D' },
-    { dte: 3, label: '3D' },
-    { dte: 5, label: '5D' },
-    { dte: 7, label: '7D' },
-  ];
-  const strikes = [3600, 3700, 3800, 3850, 3900, 4000, 4100];
-  const rv7 = 52.4; // realized vol 7d annualized %
-  const baseIV = 58;
+// ---- Fetch ETH spot price ----
+async function fetchSpot() {
+  const res = await fetch(`${BINANCE_SPOT_BASE}/api/v3/ticker/price?symbol=ETHUSDT`);
+  const data = await res.json();
+  return parseFloat(data.price);
+}
 
+// ---- Fetch all ETH option mark prices + IV from Binance ----
+async function fetchOptionsChain() {
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/mark`);
+  const data = await res.json();
+  // Filter to ETH contracts only
+  return data.filter(d => d.symbol.startsWith('ETH-'));
+}
+
+// ---- Fetch open interest for ETH options ----
+async function fetchOpenInterest() {
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/openInterest?underlyingAsset=ETH`);
+  const data = await res.json();
+  const map = {};
+  data.forEach(d => { map[d.symbol] = parseFloat(d.sumOpenInterest); });
+  return map;
+}
+
+// ---- Fetch ticker (bid/ask) for spread calculation ----
+async function fetchTickers() {
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/ticker`);
+  const data = await res.json();
+  const map = {};
+  data.filter(d => d.symbol.startsWith('ETH-')).forEach(d => {
+    const mid = (parseFloat(d.bidPrice) + parseFloat(d.askPrice)) / 2;
+    const spread = mid > 0 ? ((parseFloat(d.askPrice) - parseFloat(d.bidPrice)) / mid) * 100 : 99;
+    map[d.symbol] = {
+      bid: parseFloat(d.bidPrice),
+      ask: parseFloat(d.askPrice),
+      spread: +spread.toFixed(2),
+      volume: parseFloat(d.volume),
+    };
+  });
+  return map;
+}
+
+// ---- Compute 7-day realized vol from hourly klines (Parkinson estimator) ----
+async function computeRealizedVol() {
+  const res = await fetch(
+    `${BINANCE_SPOT_BASE}/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=168`
+  );
+  const klines = await res.json();
+  if (!klines.length) return 50;
+
+  // Parkinson estimator: σ² = (1/4n·ln2) Σ ln(H/L)²
+  let sumLogHL2 = 0;
+  klines.forEach(k => {
+    const high = parseFloat(k[2]);
+    const low = parseFloat(k[3]);
+    if (high > 0 && low > 0) {
+      const logHL = Math.log(high / low);
+      sumLogHL2 += logHL * logHL;
+    }
+  });
+  const n = klines.length;
+  const variance = sumLogHL2 / (4 * n * Math.LN2);
+  const hourlyVol = Math.sqrt(variance);
+  // Annualize: hourly → annual = hourlyVol * sqrt(8760)
+  const annualVol = hourlyVol * Math.sqrt(8760) * 100;
+  return +annualVol.toFixed(2);
+}
+
+// ---- IV History: store rolling 30-day IV snapshots in localStorage ----
+function loadIVHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(IV_HISTORY_KEY)) || {};
+  } catch { return {}; }
+}
+
+function saveIVSnapshot(contracts) {
+  const history = loadIVHistory();
+  const now = Date.now();
+  const cutoff = now - 30 * 24 * 3600 * 1000; // 30 days
+
+  contracts.forEach(c => {
+    if (!history[c.symbol]) history[c.symbol] = [];
+    history[c.symbol].push({ t: now, iv: c.iv });
+    // Prune old entries
+    history[c.symbol] = history[c.symbol].filter(e => e.t > cutoff);
+  });
+
+  localStorage.setItem(IV_HISTORY_KEY, JSON.stringify(history));
+  return history;
+}
+
+function computeIVRank(symbol, currentIV, history) {
+  const entries = history[symbol];
+  if (!entries || entries.length < 5) {
+    // Not enough history — estimate from current IV spread
+    return { ivRank: 50, ivPercentile: 50, iv30High: currentIV * 1.15, iv30Low: currentIV * 0.8 };
+  }
+  const ivs = entries.map(e => e.iv);
+  const high = Math.max(...ivs);
+  const low = Math.min(...ivs);
+  const range = high - low;
+  const ivRank = range > 0 ? ((currentIV - low) / range) * 100 : 50;
+  const below = ivs.filter(v => v <= currentIV).length;
+  const ivPercentile = (below / ivs.length) * 100;
+  return {
+    ivRank: +Math.min(100, Math.max(0, ivRank)).toFixed(1),
+    ivPercentile: +Math.min(100, Math.max(0, ivPercentile)).toFixed(1),
+    iv30High: +high.toFixed(2),
+    iv30Low: +low.toFixed(2),
+  };
+}
+
+// ---- Parse Binance symbol: ETH-250418-3400-C → { expiry, strike, side } ----
+function parseSymbol(sym) {
+  const parts = sym.split('-');
+  if (parts.length !== 4) return null;
+  const [, dateStr, strikeStr, side] = parts;
+  // dateStr = YYMMDD
+  const year = 2000 + parseInt(dateStr.slice(0, 2));
+  const month = parseInt(dateStr.slice(2, 4)) - 1;
+  const day = parseInt(dateStr.slice(4, 6));
+  const expiryDate = new Date(year, month, day, 8, 0, 0); // 08:00 UTC expiry
+  const dte = Math.max(0, Math.ceil((expiryDate - Date.now()) / (24 * 3600 * 1000)));
+  return {
+    expiry: dateStr,
+    strike: parseFloat(strikeStr),
+    side: side, // C or P
+    dte,
+    expiryDate,
+  };
+}
+
+// ---- Main fetch: combines all API calls into scanner data ----
+async function fetchLiveData() {
+  const [spot, markData, oiMap, tickerMap, rv7] = await Promise.all([
+    fetchSpot(),
+    fetchOptionsChain(),
+    fetchOpenInterest(),
+    fetchTickers(),
+    computeRealizedVol(),
+  ]);
+
+  const ivHistory = loadIVHistory();
   const contracts = [];
-  expiries.forEach(({ dte, label }) => {
-    strikes.forEach(strike => {
-      ['C', 'P'].forEach(side => {
-        // Term structure: front rich, smile around ATM
-        const moneyness = Math.abs(strike - SPOT) / SPOT;
-        const termAdj = dte <= 2 ? 8 : dte <= 5 ? 2 : -3;
-        const skew = side === 'P' ? moneyness * 40 : moneyness * 25;
-        const noise = (Math.random() - 0.5) * 6;
-        const iv = baseIV + termAdj + skew + noise;
 
-        // 30d IV stats (mocked)
-        const iv30High = iv + 18 + Math.random() * 5;
-        const iv30Low = iv - 22 + Math.random() * 4;
-        const ivRank = ((iv - iv30Low) / (iv30High - iv30Low)) * 100;
-        const ivPercentile = Math.min(100, Math.max(0, ivRank + (Math.random() - 0.5) * 15));
+  markData.forEach(m => {
+    const parsed = parseSymbol(m.symbol);
+    if (!parsed || parsed.dte < 0 || parsed.dte > 14) return; // short-DTE focus
 
-        const vrp = iv - rv7;
-        const oi = Math.floor(50 + Math.random() * 800);
-        const spread = 2 + Math.random() * 8; // bid-ask spread %
-        const volume24h = Math.floor(Math.random() * 400);
+    const iv = parseFloat(m.markIV) * 100; // Binance returns decimal (0.58 = 58%)
+    if (isNaN(iv) || iv <= 0) return;
 
-        contracts.push({
-          symbol: `ETH-${label}-${strike}-${side}`,
-          strike, side, dte, expiry: label,
-          iv: +iv.toFixed(2),
-          rv7,
-          vrp: +vrp.toFixed(2),
-          ivRank: +ivRank.toFixed(1),
-          ivPercentile: +ivPercentile.toFixed(1),
-          iv30High: +iv30High.toFixed(2),
-          iv30Low: +iv30Low.toFixed(2),
-          oi, spread: +spread.toFixed(2), volume24h,
-          delta: side === 'C'
-            ? Math.max(0.05, Math.min(0.95, 0.5 + (SPOT - strike) / 200))
-            : Math.min(-0.05, Math.max(-0.95, -0.5 + (SPOT - strike) / 200)),
-          markPrice: +(Math.random() * 80 + 20).toFixed(2),
-        });
-      });
+    const ticker = tickerMap[m.symbol] || { spread: 99, volume: 0, bid: 0, ask: 0 };
+    const oi = oiMap[m.symbol] || 0;
+    const { ivRank, ivPercentile, iv30High, iv30Low } = computeIVRank(m.symbol, iv, ivHistory);
+    const vrp = iv - rv7;
+
+    // Approximate delta from moneyness + DTE (Black-Scholes-lite)
+    const moneyness = (spot - parsed.strike) / spot;
+    const timeScale = Math.max(0.01, Math.sqrt(parsed.dte / 365));
+    let delta;
+    if (parsed.side === 'C') {
+      delta = Math.max(0.01, Math.min(0.99, 0.5 + moneyness / (2 * timeScale)));
+    } else {
+      delta = Math.min(-0.01, Math.max(-0.99, -0.5 + moneyness / (2 * timeScale)));
+    }
+
+    const dteLabel = parsed.dte <= 1 ? '1D' : parsed.dte <= 2 ? '2D' : parsed.dte <= 3 ? '3D'
+      : parsed.dte <= 5 ? `${parsed.dte}D` : `${parsed.dte}D`;
+
+    contracts.push({
+      symbol: m.symbol,
+      strike: parsed.strike,
+      side: parsed.side,
+      dte: parsed.dte,
+      expiry: dteLabel,
+      iv: +iv.toFixed(2),
+      rv7,
+      vrp: +vrp.toFixed(2),
+      ivRank,
+      ivPercentile,
+      iv30High,
+      iv30Low,
+      oi,
+      spread: ticker.spread,
+      volume24h: ticker.volume,
+      delta: +delta.toFixed(3),
+      markPrice: parseFloat(m.markPrice),
     });
   });
 
-  return { contracts, rv7, spot: SPOT, ts: NOW };
+  // Save IV snapshot for rolling history
+  saveIVSnapshot(contracts);
+
+  return { contracts, rv7, spot, ts: Date.now() };
 }
 
 // ---- Composite scoring ----
@@ -92,22 +232,41 @@ function scoreContract(c) {
 // ============================================================================
 
 export default function VegaScanner() {
-  const [data, setData] = useState(generateMockChain());
+  const [data, setData] = useState({ contracts: [], rv7: 0, spot: 0, ts: Date.now() });
   const [tab, setTab] = useState('sell');
   const [pulse, setPulse] = useState(0);
+  const [status, setStatus] = useState('CONNECTING');
+  const [error, setError] = useState(null);
+  const fetchRef = useRef(false);
+
+  const doFetch = useCallback(async () => {
+    if (fetchRef.current) return; // prevent overlapping fetches
+    fetchRef.current = true;
+    try {
+      const result = await fetchLiveData();
+      setData(result);
+      setPulse(p => p + 1);
+      setStatus('LIVE');
+      setError(null);
+    } catch (err) {
+      console.error('Fetch error:', err);
+      setError(err.message);
+      setStatus('ERROR');
+    } finally {
+      fetchRef.current = false;
+    }
+  }, []);
 
   useEffect(() => {
-    const t = setInterval(() => {
-      setData(generateMockChain());
-      setPulse(p => p + 1);
-    }, 8000);
+    doFetch(); // initial fetch
+    const t = setInterval(doFetch, POLL_INTERVAL);
     return () => clearInterval(t);
-  }, []);
+  }, [doFetch]);
 
   const scored = useMemo(() => {
     return data.contracts
       .map(c => ({ ...c, ...scoreContract(c) }))
-      .filter(c => c.spread < 10 && c.oi > 50);
+      .filter(c => c.spread < 15 && c.oi > 0); // looser filters for real data, tighten as history builds
   }, [data]);
 
   const topSells = useMemo(
@@ -176,7 +335,7 @@ export default function VegaScanner() {
           <div style={styles.brandSub}>ETH OPTIONS / BINANCE / SHORT-DTE PREMIUM</div>
         </div>
         <div style={styles.headerStats}>
-          <Stat label="ETH SPOT" value={`$${SPOT.toFixed(2)}`} />
+          <Stat label="ETH SPOT" value={data.spot ? `$${data.spot.toFixed(2)}` : '---'} />
           <Stat label="RV(7D)" value={`${data.rv7}%`} />
           <Stat label="ATM IV" value={`${stats.avgIV}%`} accent={+stats.avgIV > 60 ? 'red' : 'green'} />
           <Stat label="VRP" value={`${stats.avgVRP > 0 ? '+' : ''}${stats.avgVRP}`} accent={+stats.avgVRP > 5 ? 'red' : +stats.avgVRP < 0 ? 'green' : 'amber'} />
@@ -184,8 +343,11 @@ export default function VegaScanner() {
           <Stat label="BIAS" value={stats.bias} accent={stats.bias === 'SELL VOL' ? 'red' : stats.bias === 'BUY VOL' ? 'green' : 'amber'} small />
         </div>
         <div style={styles.live}>
-          <span className="blink" style={styles.dot} />
-          <span style={{ fontSize: 10, letterSpacing: 2 }}>LIVE · {new Date(data.ts).toLocaleTimeString()}</span>
+          <span className="blink" style={{ ...styles.dot, background: status === 'LIVE' ? '#00ff9d' : status === 'ERROR' ? '#ff3b3b' : '#ffb000', boxShadow: `0 0 8px ${status === 'LIVE' ? '#00ff9d' : status === 'ERROR' ? '#ff3b3b' : '#ffb000'}` }} />
+          <span style={{ fontSize: 10, letterSpacing: 2 }}>
+            {status} · {new Date(data.ts).toLocaleTimeString()}
+            {error && <span style={{ color: '#ff3b3b', display: 'block', fontSize: 8 }}>{error}</span>}
+          </span>
         </div>
       </header>
 
@@ -328,22 +490,25 @@ export default function VegaScanner() {
               </div>
             </div>
             <pre style={styles.code}>
-{`GET eapi.binance.com
-  /eapi/v1/mark
-  ?symbol=ETH-*
+{`LIVE: eapi.binance.com
+  /eapi/v1/mark (IV)
+  /eapi/v1/ticker (bid/ask)
+  /eapi/v1/openInterest
 
-→ markIV per contract
-→ store 30D rolling
-→ compute IVR, IVP
-→ poll @ 60s
-→ score & rank`}
+SPOT: api.binance.com
+  /api/v3/ticker/price
+  /api/v3/klines (RV7)
+
+→ poll @ ${POLL_INTERVAL/1000}s
+→ 30D rolling IVR (localStorage)
+→ Parkinson RV estimator`}
             </pre>
           </div>
         </aside>
       </main>
 
       <footer style={styles.footer}>
-        <span>VEGA·SCAN v0.1 · MOCK FEED · REPLACE generateMockChain() WITH BINANCE OPTIONS API</span>
+        <span>VEGA·SCAN v0.2 · LIVE BINANCE OPTIONS API · {data.contracts.length} CONTRACTS · POLL {POLL_INTERVAL/1000}s</span>
         <span style={{ marginLeft: 'auto', color: '#444' }}>NOT FINANCIAL ADVICE</span>
       </footer>
     </div>
