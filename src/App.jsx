@@ -23,23 +23,27 @@ async function fetchSpot() {
 async function fetchOptionsChain() {
   const res = await fetch(`${BINANCE_OPTIONS_BASE}/mark`);
   const data = await res.json();
-  // Filter to ETH contracts only
+  if (!Array.isArray(data)) return [];
   return data.filter(d => d.symbol.startsWith('ETH-'));
 }
 
 // ---- Fetch open interest for ETH options ----
 async function fetchOpenInterest() {
-  const res = await fetch(`${BINANCE_OPTIONS_BASE}/openInterest?underlyingAsset=ETH`);
-  const data = await res.json();
-  const map = {};
-  data.forEach(d => { map[d.symbol] = parseFloat(d.sumOpenInterest); });
-  return map;
+  try {
+    const res = await fetch(`${BINANCE_OPTIONS_BASE}/openInterest?underlyingAsset=ETH`);
+    const data = await res.json();
+    if (!Array.isArray(data)) return {};
+    const map = {};
+    data.forEach(d => { map[d.symbol] = parseFloat(d.sumOpenInterest || 0); });
+    return map;
+  } catch { return {}; }
 }
 
 // ---- Fetch ticker (bid/ask) for spread calculation ----
 async function fetchTickers() {
   const res = await fetch(`${BINANCE_OPTIONS_BASE}/ticker`);
   const data = await res.json();
+  if (!Array.isArray(data)) return {};
   const map = {};
   data.filter(d => d.symbol.startsWith('ETH-')).forEach(d => {
     const mid = (parseFloat(d.bidPrice) + parseFloat(d.askPrice)) / 2;
@@ -60,7 +64,7 @@ async function computeRealizedVol() {
     `${BINANCE_SPOT_BASE}/klines?symbol=ETHUSDT&interval=1h&limit=168`
   );
   const klines = await res.json();
-  if (!klines.length) return 50;
+  if (!Array.isArray(klines) || !klines.length) return 50;
 
   // Parkinson estimator: σ² = (1/4n·ln2) Σ ln(H/L)²
   let sumLogHL2 = 0;
