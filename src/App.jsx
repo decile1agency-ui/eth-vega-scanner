@@ -6,21 +6,22 @@ import { XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Area, AreaCh
 // Fetches from Binance European Options API + Spot API
 // ============================================================================
 
-const BINANCE_OPTIONS_BASE = 'https://eapi.binance.com';
-const BINANCE_SPOT_BASE = 'https://api.binance.com';
+// Proxy routes — server.js forwards to Binance to avoid CORS
+const BINANCE_OPTIONS_BASE = '/api/binance/options';
+const BINANCE_SPOT_BASE = '/api/binance/spot';
 const IV_HISTORY_KEY = 'vega_scan_iv_history';
 const POLL_INTERVAL = 60_000; // 60s
 
 // ---- Fetch ETH spot price ----
 async function fetchSpot() {
-  const res = await fetch(`${BINANCE_SPOT_BASE}/api/v3/ticker/price?symbol=ETHUSDT`);
+  const res = await fetch(`${BINANCE_SPOT_BASE}/ticker/price?symbol=ETHUSDT`);
   const data = await res.json();
   return parseFloat(data.price);
 }
 
 // ---- Fetch all ETH option mark prices + IV from Binance ----
 async function fetchOptionsChain() {
-  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/mark`);
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/mark`);
   const data = await res.json();
   // Filter to ETH contracts only
   return data.filter(d => d.symbol.startsWith('ETH-'));
@@ -28,7 +29,7 @@ async function fetchOptionsChain() {
 
 // ---- Fetch open interest for ETH options ----
 async function fetchOpenInterest() {
-  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/openInterest?underlyingAsset=ETH`);
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/openInterest?underlyingAsset=ETH`);
   const data = await res.json();
   const map = {};
   data.forEach(d => { map[d.symbol] = parseFloat(d.sumOpenInterest); });
@@ -37,7 +38,7 @@ async function fetchOpenInterest() {
 
 // ---- Fetch ticker (bid/ask) for spread calculation ----
 async function fetchTickers() {
-  const res = await fetch(`${BINANCE_OPTIONS_BASE}/eapi/v1/ticker`);
+  const res = await fetch(`${BINANCE_OPTIONS_BASE}/ticker`);
   const data = await res.json();
   const map = {};
   data.filter(d => d.symbol.startsWith('ETH-')).forEach(d => {
@@ -56,7 +57,7 @@ async function fetchTickers() {
 // ---- Compute 7-day realized vol from hourly klines (Parkinson estimator) ----
 async function computeRealizedVol() {
   const res = await fetch(
-    `${BINANCE_SPOT_BASE}/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=168`
+    `${BINANCE_SPOT_BASE}/klines?symbol=ETHUSDT&interval=1h&limit=168`
   );
   const klines = await res.json();
   if (!klines.length) return 50;
